@@ -1,17 +1,15 @@
 import re
 import streamlit as st
+import pdfplumber
 from langchain.chat_models import ChatOpenAI
-from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import Chroma
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains.conversation.memory import ConversationBufferMemory
-from langchain.agents import initialize_agent, AgentType, Tool
-from langchain.prompts import MessagesPlaceholder
-from langchain.prompts.chat import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from langchain.prompts.chat import ChatPromptTemplate
 from langchain.chains import LLMChain
+from concurrent.futures import ThreadPoolExecutor
 
 # LLM CONFIGURATION
 llm = ChatOpenAI(
@@ -24,33 +22,46 @@ llm = ChatOpenAI(
 # MEMORY CONFIGURATION
 conversational_memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True, input_key="input")
 
-
 # PDF FUNCTION
-def process_pdfs(files):
-    pdf_texts = []
-    for file in files:
-        pdf_reader = PdfReader(file)
-        for page_number, page in enumerate(pdf_reader.pages):
+def extract_text_from_pdf(file):
+    texts_with_pages = []
+    with pdfplumber.open(file) as pdf:
+        for i, page in enumerate(pdf.pages):
             text = page.extract_text()
             if text:
-                pdf_texts.append({"page": page_number + 1, "text": text})
-    return pdf_texts
+                texts_with_pages.append((text, i + 1))  # Store text with page number
+    return texts_with_pages
+
+def process_pdfs(files):
+    all_texts_with_pages = []
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(extract_text_from_pdf, file) for file in files]
+        for future in futures:
+            all_texts_with_pages.extend(future.result())
+    return all_texts_with_pages
 
 # RAG FUNCTION
-def build_rag_chain(pdf_texts):
-    texts_with_pages = []
-    for entry in pdf_texts:
-        chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(entry['text'])
+def build_rag_chain(all_texts_with_pages):
+    texts_with_metadata = []
+    splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=100)
+    
+    for text, page_num in all_texts_with_pages:
+        chunks = splitter.split_text(text)
         for chunk in chunks:
-            texts_with_pages.append({"page": entry['page'], "text": chunk})
+            texts_with_metadata.append({"text": chunk, "metadata": {"page": page_num}})
 
-    vectorstore = Chroma.from_texts([text['text'] for text in texts_with_pages], HuggingFaceEmbeddings())
+    embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    vectorstore = Chroma.from_texts(
+        [text['text'] for text in texts_with_metadata], 
+        embedding_model,
+        metadatas=[text['metadata'] for text in texts_with_metadata]  # Store metadata
+    )
     retriever = vectorstore.as_retriever()
 
     # PROMPT
     system_prompt = '''
         You are a specialized assistant designed to generate test questions for student exams or tests.
-        I want under the question, the answer and the number corespondent to the question (ex: "Answer 1"), and for multiple-choice questions, provide options labeled A, B, C, and D.
+        I want under the question, multiple-choice answers providing options labeled A, B, C, and D the answer and the number corespondent to the question (ex: "Answer 1").
         Before each question you must give the number of the questions (ex: "Question 1")
         If it is only one question you also must have the number of the question (ex: "Question 1") 
         When you generate the answer, write down the page number where the answer is in the pdf file.
@@ -65,22 +76,18 @@ def build_rag_chain(pdf_texts):
         ]
     )
 
-
-    llmchain = LLMChain(llm=llm, prompt=prompt, memory = conversational_memory)
+    llmchain = LLMChain(llm=llm, prompt=prompt, memory=conversational_memory)
     rag_chain = create_retrieval_chain(retriever, llmchain)
-    return rag_chain, texts_with_pages
+    return rag_chain
 
-# Funcție pentru extragerea întrebărilor, opțiunilor și răspunsurilor corecte
+# Function to extract generated questions and options
 def extract_generated_questions_options():
     questions = ""
     for message in st.session_state.chats[st.session_state.active_chat]:
         if message['role'] == 'assistant':
-            # Combine questions and options together
-            # Extragerea întrebărilor și opțiunilor de răspuns corelate
             question_blocks = re.findall(r'(Question \d+.*?\n(?:[A-D]\) .*?\n)+)', message['content'], re.DOTALL)
-
             for block in question_blocks:
-                questions += f"{block.strip()}\n\n"  # Adaugă fiecare bloc de întrebare și opțiuni
+                questions += f"{block.strip()}\n\n"
     return questions
 
 # Function to extract generated answers
@@ -88,16 +95,13 @@ def extract_generated_answers():
     answers = ""
     for message in st.session_state.chats[st.session_state.active_chat]:
         if message['role'] == 'assistant':
-            # Extract answers from the response using regex
-            matches = re.findall(r'Answer \d+.*', message['content'])
-            for match in matches:
-                answers += f"{match.strip()}\n"
-
+            answer_blocks = re.findall(r'Answer \d+.*?(?=\n|$)', message['content'], re.DOTALL)
+            for block in answer_blocks:
+                answers += f"{block.strip()}\n"
     return answers
 
 # Streamlit CONFIGURATION
 st.set_page_config(layout="wide")
-
 
 # INITIALISING SESSION STATES   
 if 'chats' not in st.session_state:
@@ -116,8 +120,6 @@ with st.sidebar:
             st.session_state.chats[new_chat_name] = []
             st.session_state.active_chat = new_chat_name
 
-        
-
         if st.button("Delete chat"):
             if len(st.session_state.chats) > 1:
                 del st.session_state.chats[st.session_state.active_chat]
@@ -126,13 +128,11 @@ with st.sidebar:
                 st.warning("Cannot delete the last remaining chat.")
                 
     with st.expander("Chats"):
-        
         for chat_name in st.session_state.chats.keys():
             if st.button(chat_name):
                 st.session_state.active_chat = chat_name
 
     with st.expander("Download options"):
-    # Butoane pentru descărcarea întrebărilor și opțiunilor de răspuns
         st.download_button(
             label="Download Generated Questions and Options",
             data=extract_generated_questions_options(),
@@ -146,37 +146,48 @@ with st.sidebar:
             mime="text/plain"
         )
 
+
+
 # MAIN FUNCTION
 def main():
-    #PDF UPLOADING
+    # Initialize session state variables if not already initialized
+    if "chats" not in st.session_state:
+        st.session_state.chats = {"default": []}  # Initializes chat history
+    if "active_chat" not in st.session_state:
+        st.session_state.active_chat = "default"  # Sets default active chat
+    if "pdf_texts_with_pages" not in st.session_state:
+        st.session_state.pdf_texts_with_pages = None
+    if "rag_chain" not in st.session_state:
+        st.session_state.rag_chain = None
+
+    # PDF UPLOADING
     with st.form("test_form"):
-            uploaded_files = st.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
-            if uploaded_files:
-                st.session_state.pdf_texts = process_pdfs(uploaded_files)
-                st.success("PDF content loaded successfully!")
-            # FORM GENERATION
-            with st.expander("Configure your test questions!"):
-                    num_questions = st.number_input(
-                        "Enter the number of questions:", min_value=1, step=1
-                    )
-                    difficulty = st.selectbox(
-                        "Select the difficulty level:", ["Easy", "Medium", "Hard"]
-                    )
-                    submitted = st.form_submit_button("Generate Test")
+        uploaded_files = st.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
+        if uploaded_files:
+            st.session_state.pdf_texts_with_pages = process_pdfs(uploaded_files)
+            st.success("PDF content loaded successfully!")
+        
+        # FORM GENERATION
+        with st.expander("Configure your test questions!"):
+            num_questions = st.number_input(
+                "Enter the number of questions:", min_value=1, step=1
+            )
+            difficulty = st.selectbox(
+                "Select the difficulty level:", ["Easy", "Medium", "Hard"]
+            )
+            submitted = st.form_submit_button("Generate Test")
 
     if submitted:
-        if not st.session_state.pdf_texts:
+        if not st.session_state.pdf_texts_with_pages:
             st.warning("Please upload a PDF file before generating the test.")
         else:
             user_input = f"Generate {num_questions} {difficulty} questions based on the uploaded PDFs."
             st.session_state.chats[st.session_state.active_chat].append({"role": "user", "content": user_input})
-            st.session_state.rag_chain, texts_with_pages = build_rag_chain(st.session_state.pdf_texts)
-            response = st.session_state.rag_chain.invoke({"input": user_input}) ['answer'] ['text']
+            st.session_state.rag_chain = build_rag_chain(st.session_state.pdf_texts_with_pages)
+            response = st.session_state.rag_chain.invoke({"input": user_input})['answer']['text']
             st.session_state.chats[st.session_state.active_chat].append({"role": "assistant", "content": response})
 
-    
     # CHAT HISTORY
-    # st.write("Chat History:")
     for elem in st.session_state.chats[st.session_state.active_chat]:
         with st.chat_message(elem['role']):
             st.write(elem['content'])
@@ -192,7 +203,7 @@ def main():
 
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
-            full_response = st.session_state.rag_chain.invoke({"input": user_input}) ['answer'] ['text']
+            full_response = st.session_state.rag_chain.invoke({"input": user_input})['answer']['text']
             message_placeholder.markdown(full_response)
         
         st.session_state.chats[st.session_state.active_chat].append({"role": "assistant", "content": full_response})
@@ -200,8 +211,6 @@ def main():
         # Update conversation memory
         conversational_memory.chat_memory.add_user_message(user_input)
         conversational_memory.chat_memory.add_ai_message(full_response)
-
-    
 
 if __name__ == "__main__":
     main()
